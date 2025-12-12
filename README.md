@@ -1,13 +1,28 @@
 # ⚡ File Cache — файловый кеш для PHP 8.1+
 
-Лёгкий, стабильный и быстрый файловый кеш-движок для TBDev/Torrentside.  
-Работает полностью *без Memcached, Redis и XCache*, используя:
+**File Cache** — быстрый и надёжный кеш-движок для **TBDev**, который работает **без Memcached, Redis и XCache** и хранит всё прямо в файловой системе проекта.
+
+Он создан для реальных нагрузок трекера: **кеширование SQL-запросов**, тяжёлых вычислений, блоков страниц, а также **файлов/картинок** (в `cache/`), с защитой от stampede (одновременных пересчётов) и поддержкой **OPcache**.
+
+---
+
+## ✅ Что он использует
 
 - каталог `cache/` в корне проекта;
-- атомарную запись файлов;
-- PHP-файлы, кешируемые **OPcache**;
-- безопасную сериализацию;
-- удобный API.
+- **атомарную запись** (tmp → rename) без битых кеш-файлов;
+- **PHP-файлы метаданных**, которые отлично кешируются **OPcache**;
+- хранение **крупных значений** в `.bin` (не раздувает `.php`);
+- опциональную компрессию больших данных;
+- **lock-файлы** для защиты от множественных одновременных пересчётов;
+- удобный API (get/set/remember/delete/clear) + SQL helper.
+
+---
+
+## Быстрый пример
+
+```php
+$result = cache()->remember('top:torrents', 120, fn() => get_top_torrents());
+```
 
 Пример использования:
 
@@ -20,26 +35,32 @@ cache()->remember('key', 300, fn() => compute());
 ## 🚀 Особенности
 
 - Оптимизирован под PHP 8.1+
-- Использует OPcache для ускоренного чтения кеш-файлов
+- Быстрое чтение через OPcache (метаданные в PHP-return файлах)
 - Не требует внешних сервисов
-- Атомарная запись исключает повреждения кеша
-- Поддерживает методы:
-  - get()
-  - set()
-  - remember()
-  - delete()
-  - clear()
-- Встроенный SQL-кешер: sql_query_cached()
+- Sharding: разбиение кеша по подпапкам (не создаёт свалку из 100k файлов в одной директории)
+- Anti-stampede: per-key lock + double-check внутри remember()
+- Поддержка больших значений: .php (meta) + .bin (payload)
+- Опциональная компрессия больших значений
+- Встроенная очистка протухших записей (GC)
+
+Кеширование SQL:
+- sql_query_cached()
+- sql_row_cached()
+- sql_scalar_cached()
+
+Кеширование файлов/картинок:
+- rememberFile() (локальный файл или URL)
+- getFilePath()
 
 ---
 
 ## 📁 Структура проекта
 
 ```
-/cache/                   ← кеш-файлы
-/include/file_cache.php   ← класс FileCache
-/include/cache_boot.php   ← глобальная функция cache()
-/include/sql_cache.php    ← SQL-кеширование
+/cache/                     ← кеш (данные + files)
+/include/file_cache.php     ← движок FileCache
+/include/cache_boot.php     ← глобальная функция cache()
+/include/sql_cache.php      ← SQL-хелперы
 ```
 
 ---
@@ -57,111 +78,8 @@ chmod 775 cache
 
 ## 2. Файл: include/file_cache.php
 
-```php
-<?php
-declare(strict_types=1);
-
-final class FileCache
-{
-    private string $dir;
-    private int $defaultTtl;
-
-    public function __construct(string $dir, int $defaultTtl = 300)
-    {
-        $this->dir = rtrim($dir, DIRECTORY_SEPARATOR);
-
-        if (!is_dir($this->dir)) {
-            mkdir($this->dir, 0775, true);
-        }
-
-        if (!is_writable($this->dir)) {
-            throw new RuntimeException("Cache dir '{$this->dir}' is not writable");
-        }
-
-        $this->defaultTtl = $defaultTtl;
-    }
-
-    private function keyToPath(string $key): string
-    {
-        $short = preg_replace('~[^a-zA-Z0-9_\-]~', '_', substr($key, 0, 40));
-        $hash  = sha1($key);
-
-        return $this->dir . DIRECTORY_SEPARATOR . $short . '_' . $hash . '.php';
-    }
-
-    public function get(string $key, mixed $default = null): mixed
-    {
-        $path = $this->keyToPath($key);
-
-        if (!is_file($path)) {
-            return $default;
-        }
-
-        $data = @include $path;
-
-        if (!is_array($data) || !isset($data['e'], $data['v'])) {
-            @unlink($path);
-            return $default;
-        }
-
-        if ($data['e'] !== 0 && $data['e'] < time()) {
-            @unlink($path);
-            return $default;
-        }
-
-        return @unserialize($data['v'], ['allowed_classes' => true]);
-    }
-
-    public function set(string $key, mixed $value, ?int $ttl = null): void
-    {
-        $path = $this->keyToPath($key);
-
-        $ttl ??= $this->defaultTtl;
-        $expiresAt = $ttl > 0 ? time() + $ttl : 0;
-
-        $payload = [
-            'e' => $expiresAt,
-            'v' => serialize($value),
-        ];
-
-        $php = '<?php return ' . var_export($payload, true) . ';';
-
-        $temp = $path . '.' . bin2hex(random_bytes(4)) . '.tmp';
-
-        file_put_contents($temp, $php, LOCK_EX);
-        chmod($temp, 0664);
-        rename($temp, $path);
-    }
-
-    public function remember(string $key, int $ttl, callable $callback): mixed
-    {
-        $cached = $this->get($key);
-
-        if ($cached !== null) {
-            return $cached;
-        }
-
-        $value = $callback();
-        $this->set($key, $value, $ttl);
-
-        return $value;
-    }
-
-    public function delete(string $key): void
-    {
-        $path = $this->keyToPath($key);
-        if (is_file($path)) {
-            unlink($path);
-        }
-    }
-
-    public function clear(): void
-    {
-        foreach (glob($this->dir . '/*.php') as $file) {
-            unlink($file);
-        }
-    }
-}
+```Вставь актуальную версию движка FileCache (из текущей реализации проекта).
+Важно: файл создаёт подпапки внутри cache/ автоматически.
 ```
 
 ---
@@ -179,11 +97,23 @@ function cache(): FileCache
     static $instance = null;
 
     if ($instance === null) {
-        $instance = new FileCache(ROOT_PATH . '/cache', 300);
+        $instance = new FileCache(
+            dir: ROOT_PATH . '/cache',
+            defaultTtl: 300,
+            options: [
+                'salt' => 'tbdev:file-cache:v1',
+                'shard_depth' => 2,
+                'max_inline_bytes' => 262144,
+                'compress_threshold' => 8192,
+                'allowed_classes' => false,
+                'gc_probability' => 0.01,
+            ]
+        );
     }
 
     return $instance;
 }
+
 ```
 
 ---
@@ -192,10 +122,40 @@ function cache(): FileCache
 
 ```php
 <?php
+declare(strict_types=1);
+
+function sql_cache_normalize(string $sql): string
+{
+    $sql = trim($sql);
+    $sql = preg_replace('~\s+~u', ' ', $sql) ?? $sql;
+    return $sql;
+}
+
+function sql_cache_normalize_params(array $params): array
+{
+    $isAssoc = array_keys($params) !== range(0, count($params) - 1);
+    if ($isAssoc) {
+        ksort($params);
+    }
+    return $params;
+}
 
 function sql_query_cached(string $sql, array $params = [], int $ttl = 300): array
 {
-    $key = 'sql:' . $sql . '|' . json_encode($params, JSON_UNESCAPED_UNICODE);
+    if ($ttl <= 0) {
+        global $pdo;
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute($params);
+        return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    }
+
+    $sqlN = sql_cache_normalize($sql);
+    $paramsN = sql_cache_normalize_params($params);
+
+    $sqlCacheVersion = defined('SQL_CACHE_VERSION') ? (string)SQL_CACHE_VERSION : 'v1';
+
+    $keyMaterial = $sqlCacheVersion . "\0" . $sqlN . "\0" . json_encode($paramsN, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    $key = 'sql:' . hash('sha256', $keyMaterial);
 
     return cache()->remember($key, $ttl, function () use ($sql, $params) {
         global $pdo;
@@ -206,6 +166,25 @@ function sql_query_cached(string $sql, array $params = [], int $ttl = 300): arra
         return $stmt->fetchAll(PDO::FETCH_ASSOC);
     });
 }
+
+function sql_row_cached(string $sql, array $params = [], int $ttl = 300): ?array
+{
+    $rows = sql_query_cached($sql, $params, $ttl);
+    return $rows[0] ?? null;
+}
+
+function sql_scalar_cached(string $sql, array $params = [], int $ttl = 300): mixed
+{
+    $row = sql_row_cached($sql, $params, $ttl);
+    if ($row === null) {
+        return null;
+    }
+    foreach ($row as $v) {
+        return $v;
+    }
+    return null;
+}
+
 ```
 
 ---
@@ -235,21 +214,41 @@ $rows = sql_query_cached(
     [],
     60
 );
-```
 
+```
+## Кеширование файла/картинки
+
+```php
+// локальный файл или URL
+$path = cache()->rememberFile(
+    key: 'avatar:user:15',
+    ttl: 3600,
+    source: 'https://example.com/avatar.jpg',
+    ext: 'jpg'
+);
+
+// дальше можно отдавать файл из $path через nginx/php
+
+```
 ---
 
 # ⚙ Рекомендации по производительности
 
-- Включить **OPcache**
-- Кешировать:
-  - главную страницу
-  - блоки 
-  - тяжёлые SELECT/JOIN
-- Инвалидировать кеш при:
-  - добавлении торрента
-  - комментарии
-  - обновлении новостей
+- Включить OPcache (и убедиться, что opcache.enable=1)
+
+Кешировать в первую очередь:
+- главную страницу (блоки)
+- топы/списки/каталоги
+- тяжёлые SELECT/JOIN и агрегаты
+
+Инвалидировать кеш логически:
+- при добавлении торрента (сброс “топов/списков”)
+- при комментариях (сброс страницы торрента/комментов)
+- при обновлении новостей (сброс новостного блока)
+  
+Для глобального сброса SQL-кеша можно поднять:
+
+- define('SQL_CACHE_VERSION', 'v2');
 
 ---
 
